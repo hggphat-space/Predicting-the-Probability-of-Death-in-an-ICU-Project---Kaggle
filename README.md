@@ -149,7 +149,6 @@ Feature importance from XGBoost highlights:
 These patterns align well with clinical expectations around ICU mortality risk.
 
 ---
----
 
 ### How to Run
 
@@ -234,6 +233,7 @@ All AI-suggested ideas and code were **reviewed, tested, and adapted by me**, an
 - Le Gall JR, Lemeshow S, Saulnier F. *A new Simplified Acute Physiology Score (SAPS II)*.  
 - Knaus WA, Draper EA, Wagner DP, Zimmerman JE. *APACHE II: a severity of disease classification system*.  
 - Monash University, **ETC3250/5250** materials on predictive modelling and health analytics.
+
 
 
 
