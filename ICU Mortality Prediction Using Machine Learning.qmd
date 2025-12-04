@@ -1,0 +1,726 @@
+---
+title: "ETC3250/5250 Project"
+author: "HOANG GIA PHAT"
+date: "2025-05-25"
+---
+```{r}
+setwd("C:/Users/ASUS/OneDrive/Máy tính/ETC3250")
+# 📚 Load libraries
+library(nnet)
+library(readr)
+library(dplyr)
+library(xgboost)
+library(tibble)
+library(lubridate)
+library(caret)
+library(pROC)
+
+
+
+# 📥 Load data
+train_X <- read_csv("mimic_train_X.csv")
+train_y <- read_csv("mimic_train_y.csv")
+test_X  <- read_csv("mimic_test_X.csv")
+
+
+# Clean up unreasonable ages
+# 🧹 Hàm làm sạch và tính AGE
+clean_and_compute_age <- function(df) {
+  # 1. Chuyển DOB và ADMITTIME sang character (tránh lỗi nếu đang là factor)
+  df$DOB <- as.character(df$DOB)
+  df$ADMITTIME <- as.character(df$ADMITTIME)
+  
+  # 2. Loại bỏ những dòng có DOB hoặc ADMITTIME là "#VALUE!" hoặc NA
+  df$DOB[df$DOB == "#VALUE!" | is.na(df$DOB)] <- NA
+  df$ADMITTIME[df$ADMITTIME == "#VALUE!" | is.na(df$ADMITTIME)] <- NA
+
+  # 3. Ép kiểu về Date theo định dạng phù hợp
+  df$DOB <- suppressWarnings(as.Date(df$DOB, tryFormats = c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y")))
+  df$ADMITTIME <- suppressWarnings(as.Date(df$ADMITTIME, tryFormats = c("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y")))
+
+  # 4. Tính tuổi bằng năm
+  df$AGE <- as.numeric(format(df$ADMITTIME, "%Y")) - as.numeric(format(df$DOB, "%Y"))
+
+  # 5. Loại bỏ những giá trị tuổi không hợp lệ (< 0 hoặc > 120)
+  df$AGE[df$AGE < 0 | df$AGE > 120] <- NA
+
+  return(df)
+}
+
+#Apply it for rain và test
+train_X <- clean_and_compute_age(train_X)
+test_X  <- clean_and_compute_age(test_X)
+```
+#Visualize the clean data
+```{r}
+ggplot(train_X, aes(x = AGE, fill = as.factor(train_y$HOSPITAL_EXPIRE_FLAG))) +
+  geom_histogram(binwidth = 5, alpha = 0.6, position = "identity") +
+  labs(title = "Distribution of Age by Mortality", x = "Age", fill = "Expired") +
+  theme_minimal()
+
+vitals <- c("HeartRate_Mean", "SysBP_Mean", "SpO2_Mean", "Glucose_Mean")
+plot_list <- lapply(vitals, function(var) {
+  ggplot(train_X, aes(x = as.factor(train_y$HOSPITAL_EXPIRE_FLAG), y = .data[[var]])) +
+    geom_boxplot(fill = "#69b3a2", alpha = 0.6) +
+    labs(title = paste(var, "by Mortality"), x = "Expired", y = var) +
+    theme_minimal()
+})
+# Arrange plots in a 2x2 grid
+gridExtra::grid.arrange(grobs = plot_list, ncol = 2)
+```
+```{r}
+icu_plot <- train_X %>%
+  mutate(HOSPITAL_EXPIRE_FLAG = train_y$HOSPITAL_EXPIRE_FLAG) %>%
+  group_by(FIRST_CAREUNIT) %>%
+  summarise(MortalityRate = mean(HOSPITAL_EXPIRE_FLAG)) %>%
+  arrange(desc(MortalityRate))
+
+ggplot(icu_plot, aes(x = reorder(FIRST_CAREUNIT, -MortalityRate), y = MortalityRate)) +
+  geom_col(fill = "tomato") +
+  labs(title = "Mortality Rate by ICU Unit", x = "ICU Unit", y = "Mortality Rate") +
+  theme_minimal() +
+  coord_flip()
+
+```
+
+
+#ICD9 from others file
+```{r}
+setwd("C:/Users/ASUS/OneDrive/Máy tính/ETC3250")
+# 📥 Load file 
+metadata <- read_csv("MIMIC_metadata_diagnose.csv")
+diagnoses <- read_csv("MIMIC_diagnoses.csv")
+
+# 🧼 Chỉ giữ những mã có độ dài hợp lệ
+diagnoses <- diagnoses %>%
+  filter(!is.na(ICD9_CODE)) %>%
+  mutate(ICD9_GROUP = substr(ICD9_CODE, 1, 3))
+
+# Identify rare codes (appearing in < 10 records)
+rare_codes <- diagnoses %>%
+  group_by(ICD9_GROUP) %>%
+  summarise(freq = n()) %>%
+  filter(freq < 10) %>%
+  pull(ICD9_GROUP)
+
+# Drop those rare codes
+diagnoses_filtered <- diagnoses %>%
+  filter(!(substr(ICD9_CODE, 1, 3) %in% rare_codes))
+
+# 📌 Gộp tất cả các nhóm ICD9 theo icustay_id
+diagnoses_grouped <- diagnoses_filtered %>%
+  mutate(ICD9_GROUP = substr(ICD9_CODE, 1, 3)) %>%
+  distinct(SUBJECT_ID, HADM_ID, ICD9_GROUP) %>%
+  mutate(flag = 1) %>%
+  tidyr::pivot_wider(names_from = ICD9_GROUP, values_from = flag, values_fill = 0, names_prefix = "ICD9_")
+
+# 🧩 Giả sử bạn có cột icustay_id trong train/test — chúng ta cần ánh xạ HADM_ID sang icustay_id
+# Nếu mimic_train_X.csv có cột HADM_ID thì merge trực tiếp:
+if ("HADM_ID" %in% names(train_X)) {
+  train_X <- left_join(train_X, diagnosis_grouped, by = c("HADM_ID"))
+}
+if ("HADM_ID" %in% names(test_X)) {
+  test_X <- left_join(test_X, diagnosis_grouped, by = c("HADM_ID"))
+}
+
+# Nếu chỉ có SUBJECT_ID trong test/train thì dùng SUBJECT_ID
+if (!"HADM_ID" %in% names(train_X) && "SUBJECT_ID" %in% names(train_X)) {
+  train_X <- left_join(train_X, diagnosis_grouped, by = c("SUBJECT_ID"))
+}
+if (!"HADM_ID" %in% names(test_X) && "SUBJECT_ID" %in% names(test_X)) {
+  test_X <- left_join(test_X, diagnosis_grouped, by = c("SUBJECT_ID"))
+}
+
+# 🧼 Gán NA (không có chẩn đoán phụ nào) thành 0
+icd9_dummy_vars <- grep("^ICD9_", names(train_X), value = TRUE)
+for (col in icd9_dummy_vars) {
+  train_X[[col]][is.na(train_X[[col]])] <- 0
+  test_X[[col]][is.na(test_X[[col]])] <- 0
+}
+
+ctrl <- rfeControl(functions = caretFuncs, method = "cv", number = 5)
+
+
+
+```
+```{r}
+# 🧩 ICD9 Category and LOS_days feature
+extract_icd9_and_los <- function(df) {
+  # ICD9_category = first 3 characters
+  if ("ICD9_diagnosis" %in% names(df)) {
+    df$ICD9_category <- substr(df$ICD9_diagnosis, 1, 3)
+  }
+  # LOS in days
+  if ("Diff" %in% names(df)) {
+    df$LOS_days <- df$Diff / 24
+  }
+  return(df)
+}
+
+# Apply
+train_X <- extract_icd9_and_los(train_X)
+test_X  <- extract_icd9_and_los(test_X)
+
+```
+
+```{r}
+create_icd9_dummies <- function(train_df, test_df) {
+  # Combine all ICD9 categories
+  all_icd9 <- union(unique(train_df$ICD9_category), unique(test_df$ICD9_category))
+  all_icd9 <- all_icd9[!is.na(all_icd9)]
+
+  for (code in all_icd9) {
+    col <- paste0("ICD9_", code)
+    train_df[[col]] <- ifelse(train_df$ICD9_category == code, 1, 0)
+    test_df[[col]]  <- ifelse(test_df$ICD9_category == code, 1, 0)
+  }
+
+  # Drop original category column
+  train_df$ICD9_category <- NULL
+  test_df$ICD9_category  <- NULL
+
+  return(list(train = train_df, test = test_df, new_vars = paste0("ICD9_", all_icd9)))
+}
+
+# Apply
+icd9_result <- create_icd9_dummies(train_X, test_X)
+train_X <- icd9_result$train
+test_X  <- icd9_result$test
+icd9_vars <- icd9_result$new_vars
+```
+
+```{r}
+add_age_bucket_dummies <- function(df) {
+  if (!("AGE" %in% names(df))) stop("Cột AGE không tồn tại.")
+
+  # Gắn nhóm tuổi, xử lý NA bằng cách thêm "unknown"
+  df$age_bucket <- cut(
+    df$AGE,
+    breaks = c(-Inf, 30, 60, Inf),
+    labels = c("young", "adult", "elderly"),
+    right = FALSE
+  )
+  df$age_bucket <- addNA(df$age_bucket)
+  levels(df$age_bucket)[is.na(levels(df$age_bucket))] <- "unknown"
+
+  # Mã hóa dummy
+  age_dummies <- model.matrix(~ age_bucket - 1, data = df)
+  colnames(age_dummies) <- gsub("age_bucket", "", colnames(age_dummies))
+
+  # Gắn vào dataframe
+  df <- cbind(df, as.data.frame(age_dummies))
+  return(df)
+}
+
+# ✅ Áp dụng
+train_X <- add_age_bucket_dummies(train_X)
+test_X  <- add_age_bucket_dummies(test_X)
+
+
+
+# ✅ Define physiology-based outlier limits
+limits <- list(
+  HeartRate_Max = c(30, 220), HeartRate_Mean = c(30, 200),
+  SysBP_Min = c(50, 180), SysBP_Max = c(60, 250), SysBP_Mean = c(60, 200),
+  DiasBP_Min = c(30, 120), DiasBP_Max = c(40, 150), DiasBP_Mean = c(40, 130),
+  MeanBP_Min = c(40, 130), MeanBP_Max = c(50, 150), MeanBP_Mean = c(50, 140),
+  RespRate_Min = c(5, 40), RespRate_Max = c(8, 60), RespRate_Mean = c(8, 50),
+  TempC_Min = c(30, 43), TempC_Max = c(31, 45), TempC_Mean = c(32, 44),
+  SpO2_Min = c(50, 100), SpO2_Max = c(60, 100), SpO2_Mean = c(70, 100),
+  Glucose_Min = c(30, 500), Glucose_Max = c(40, 600), Glucose_Mean = c(40, 500)
+)
+
+# ✅ Create outlier flag features
+generate_outlier_flags <- function(df, limits) {
+  for (col in names(limits)) {
+    low <- limits[[col]][1]
+    high <- limits[[col]][2]
+    df[[paste0(col, "_too_low")]] <- as.integer(df[[col]] < low)
+    df[[paste0(col, "_too_high")]] <- as.integer(df[[col]] > high)
+  }
+  return(df)
+}
+
+# ✅ Feature engineering additions
+add_engineered_features <- function(df) {
+  df <- df %>%
+    mutate(
+      Shock_Index = HeartRate_Mean / (SysBP_Mean + 1e-5),
+      MAP = (2 * DiasBP_Mean + SysBP_Mean) / 3,
+      Pulse_Pressure = SysBP_Mean - DiasBP_Mean,
+      HR_BP_Ratio = HeartRate_Mean / (MeanBP_Mean + 1e-5),
+      Resp_Temp_Interaction = RespRate_Mean * TempC_Mean,
+      Glucose_Instability = Glucose_Max - Glucose_Min,
+      O2_Desat_Risk = ifelse(SpO2_Min < 85, 1, 0),
+      Is_Elderly = ifelse(AGE >= 70, 1, 0),
+      Shock_Severity = ifelse(Shock_Index > 0.9, 1, 0),
+      HR_RR_Ratio = HeartRate_Mean / (RespRate_Mean + 1e-5),
+      Temp_Glucose_Ratio = TempC_Mean / (Glucose_Mean + 1e-5),
+      MAP_Temp_Interaction = MAP * TempC_Mean,
+      Pulse_SpO2_Ratio = Pulse_Pressure / (SpO2_Mean + 1e-5),
+      Age_Shock_Index = AGE * Shock_Index,
+      Age_Is_Emergency = AGE * Is_emergency,
+      Glucose_Temp_Interaction = Glucose_Instability * TempC_Mean,
+      Shock_Risk_Combo = Shock_Index * Risk_score,
+      MAP_Pulse_Interaction = MAP * Pulse_Pressure,
+      Elderly_Shock = Is_Elderly * Shock_Index,
+      Elderly_Hypoxia = Is_Elderly * O2_Desat_Risk,
+      Age_MAP_Ratio = AGE / (MAP + 1e-5)	,
+      
+      HeartRate_Range = HeartRate_Max - HeartRate_Min,
+      DiasBP_Range = DiasBP_Max - DiasBP_Min,
+      MeanBP_Range = MeanBP_Max - MeanBP_Min,
+      RespRate_Range = RespRate_Max - RespRate_Min,
+      TempC_Range = TempC_Max - TempC_Min,
+      SpO2_Range = SpO2_Max - SpO2_Min,
+
+    )
+  return(df)
+}
+
+# ✅ Composite risk score (based on weighted clinical flags)
+add_composite_risk <- function(df) {
+  flags <- c("Low_SysBP", "Hypoxemia", "Tachycardia", "Hyperglycemia", "Hypothermia")
+  for (flag in flags) {
+    if (!(flag %in% names(df))) {
+      df[[flag]] <- 0
+    }
+  }
+  df$Risk_score <- 1.5 * df$Low_SysBP + 2.0 * df$Hypoxemia + 1.2 * df$Tachycardia +
+                   1.0 * df$Hyperglycemia + 1.0 * df$Hypothermia
+  return(df)
+}
+
+# ✅ Add ICU unit and admission-based risk features
+add_contextual_flags <- function(df, high_risk_unit) {
+  df$High_risk_unit <- as.integer(df$FIRST_CAREUNIT %in% high_risk_unit)
+  df$Is_emergency <- as.integer(df$ADMISSION_TYPE == "EMERGENCY")
+  return(df)
+}
+
+# Compute high-risk unit from train
+unit_mortality <- train_X %>%
+  group_by(FIRST_CAREUNIT) %>%
+  summarise(death_rate = mean(as.numeric(train_y$HOSPITAL_EXPIRE_FLAG[match(icustay_id, train_X$icustay_id)]))) %>%
+  arrange(desc(death_rate))
+high_risk_unit <- unit_mortality$FIRST_CAREUNIT[1]
+
+# Apply all transformations
+train_X <- generate_outlier_flags(train_X, limits)
+train_X <- add_contextual_flags(train_X, high_risk_unit)
+train_X <- add_composite_risk(train_X)           # 👈 Compute Risk_score first
+train_X <- add_engineered_features(train_X)      # 👈 Then you can use it here
+
+test_X <- generate_outlier_flags(test_X, limits)
+test_X <- add_contextual_flags(test_X, high_risk_unit)
+test_X <- add_composite_risk(test_X)
+test_X <- add_engineered_features(test_X)
+
+
+
+
+# ✅ Final features
+flag_vars <- grep("too_low|too_high", names(train_X), value = TRUE)
+engineered_vars <- c(
+  "Shock_Index", "MAP", "Pulse_Pressure", "HR_BP_Ratio", 
+  "Resp_Temp_Interaction", "Glucose_Instability", 
+  "O2_Desat_Risk", "Is_Elderly", "Shock_Severity",
+  "HR_RR_Ratio", "Temp_Glucose_Ratio", "MAP_Temp_Interaction", "Pulse_SpO2_Ratio",
+  "High_risk_unit", "Is_emergency", "Risk_score", "Age_Shock_Index", "Age_Is_Emergency", "Glucose_Temp_Interaction",
+  "Shock_Risk_Combo", "MAP_Pulse_Interaction", 
+  "Elderly_Shock", "Elderly_Hypoxia", "Age_MAP_Ratio","HeartRate_Range","DiasBP_Range","MeanBP_Range","RespRate_Range","TempC_Range","SpO2_Range"
+)
+
+ # Best performing subset
+
+final_features <- c(
+  flag_vars,
+  engineered_vars,
+  "AGE",
+  "young", "adult", "elderly" ,"LOS_days",icd9_vars, icd9_dummy_vars
+)
+
+# ✅ Handle missing values
+numeric_final_features <- final_features[sapply(train_X[, final_features], is.numeric)]
+
+
+
+# 2. Kiểm tra lại chiều dữ liệu để chắc chắn
+str(train_X[, numeric_final_features])
+for (col in final_features) {
+  # Nếu không phải numeric, ép kiểu
+  if (!is.numeric(train_X[[col]])) {
+    train_X[[col]] <- as.numeric(as.character(train_X[[col]]))
+    test_X[[col]] <- as.numeric(as.character(test_X[[col]]))
+  }
+}
+for (col in final_features) {
+  train_X[[col]][is.na(train_X[[col]])] <- median(train_X[[col]], na.rm = TRUE)
+  test_X[[col]][is.na(test_X[[col]])] <- median(test_X[[col]], na.rm = TRUE)
+}
+
+# 4. Xóa các biến zero variance (biến không có độ biến thiên)
+zero_var_info <- nearZeroVar(train_X[, numeric_final_features], saveMetrics = TRUE)
+zero_var_cols <- rownames(zero_var_info[zero_var_info$zeroVar == TRUE, ])
+numeric_final_features <- setdiff(numeric_final_features, zero_var_cols)
+
+# 5. Standardization
+preproc <- preProcess(train_X[, numeric_final_features], method = c("center", "scale"))
+train_X[, numeric_final_features] <- predict(preproc, train_X[, numeric_final_features])
+test_X[, numeric_final_features] <- predict(preproc, test_X[, numeric_final_features])
+
+#Removing Multicollinearity
+cor_matrix <- cor(train_X[, numeric_final_features], use = "pairwise.complete.obs")
+high_cor <- findCorrelation(cor_matrix, cutoff = 0.8)
+numeric_final_features <- numeric_final_features[-high_cor]
+
+
+# 7. Gộp với các biến categorical (nếu có)
+non_numeric_features <- setdiff(final_features, numeric_final_features)
+final_features <- c(numeric_final_features, non_numeric_features)
+
+
+# ✅ Prepare matrices
+dtrain <- xgb.DMatrix(data = as.matrix(train_X[, final_features]), label = train_y$HOSPITAL_EXPIRE_FLAG)
+dtest  <- xgb.DMatrix(data = as.matrix(test_X[, final_features]))
+
+```
+#Logistic Regression
+```{r}
+logit_data <- train_X[, final_features]
+logit_data$HOSPITAL_EXPIRE_FLAG <- factor(ifelse(train_y$HOSPITAL_EXPIRE_FLAG == 1, "yes", "no"))
+
+# 🧠 Fit Logistic Regression Model
+set.seed(42)
+model_logit <- glm(HOSPITAL_EXPIRE_FLAG ~ ., data = logit_data, family = "binomial")
+
+# 🔍 Predict probabilities on training set
+logit_probs <- predict(model_logit, type = "response")
+
+# 📈 Evaluate AUC
+roc_glm <- roc(response = logit_data$HOSPITAL_EXPIRE_FLAG, predictor = logit_probs)
+auc_glm <- auc(roc_glm)
+plot(roc_glm, col = "blue", main = "Logistic Regression ROC Curve")
+cat("Logistic Regression AUC:", round(auc_glm, 3), "\n")
+cat("AUC (Logistic Regression):", auc(roc_glm), "\n")
+```
+#Decision Tree (rpart)
+```{r}
+library(rpart)
+
+# Combine training data
+data_tree <- cbind(train_X[, final_features], HOSPITAL_EXPIRE_FLAG = factor(train_y$HOSPITAL_EXPIRE_FLAG))
+
+# Fit decision tree model
+model_tree <- rpart(HOSPITAL_EXPIRE_FLAG ~ ., data = data_tree, method = "class", control = rpart.control(cp = 0.01))
+
+# Predict probabilities
+pred_tree <- predict(model_tree, newdata = data_tree, type = "prob")[, "1"]
+
+# Compute ROC and AUC
+roc_tree <- roc(data_tree$HOSPITAL_EXPIRE_FLAG, pred_tree)
+auc_tree <- auc(roc_tree)
+cat("Decision Tree AUC:", round(auc_tree, 3), "\n")
+```
+# Boosted Tree
+```{r}
+library(caret)
+library(xgboost)
+
+# Prepare data
+train_matrix <- xgb.DMatrix(data = as.matrix(train_X[, final_features]), label = train_y$HOSPITAL_EXPIRE_FLAG)
+
+# Set parameters
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.03,
+  gamma = 0.3,
+  subsample = 0.8,
+  colsample_bytree = 0.7
+)
+
+# Train model
+xgb_model <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = 200,
+  verbose = 1
+)
+
+# Predict
+pred_xgb <- predict(xgb_model, train_matrix)
+
+# Compute ROC and AUC
+roc_xgb <- roc(train_y$HOSPITAL_EXPIRE_FLAG, pred_xgb)
+auc_xgb <- auc(roc_xgb)
+cat("XGBoost AUC:", round(auc_xgb, 3), "\n")
+
+
+```
+#Neutral Network
+```{r}
+pca_model <- preProcess(train_X[, numeric_final_features], method = "pca", pcaComp = 20)
+train_pca <- predict(pca_model, train_X[, numeric_final_features])
+train_pca$HOSPITAL_EXPIRE_FLAG <- factor(ifelse(train_y$HOSPITAL_EXPIRE_FLAG == 1, "yes", "no"))
+ctrl <- trainControl(method = "none", classProbs = TRUE, summaryFunction = twoClassSummary)
+
+# Train neural net on PCA-reduced data
+set.seed(42)
+model_nn <- train(
+  HOSPITAL_EXPIRE_FLAG ~ .,
+  data = train_pca,
+  method = "nnet",
+  trace = FALSE,
+  tuneGrid = expand.grid(size = 5, decay = 0.01),
+  metric = "ROC",
+  trControl = ctrl
+)
+test_pca <- as.data.frame(predict(pca_model, test_X[, numeric_final_features]))
+
+nn_probs <- predict(model_nn, newdata = test_pca, type = "prob")[, "yes"]
+
+
+nn_train_probs <- predict(model_nn, newdata = train_pca, type = "prob")[, "yes"]
+roc_nn <- roc(response = train_pca$HOSPITAL_EXPIRE_FLAG, predictor = nn_train_probs)
+auc_nn_value <- auc(roc_nn)
+
+
+
+```
+```{r}
+# Plot with others
+plot(roc_glm, col = "blue", lwd = 2, main = "ROC Curve Comparison")
+lines(roc_tree, col = "green", lwd = 2)
+lines(roc_xgb, col = "red", lwd = 2)
+lines(auc_nn_value, col = "purple", lwd = 2)
+
+legend("bottomright", legend = c(
+  paste("Logistic Regression (AUC =", round(auc(roc_glm), 3), ")"),
+  paste("Decision Tree (AUC =", round(auc(roc_tree), 3), ")"),
+  paste("XGBoost (AUC =", round(auc(roc_xgb), 3), ")"),
+  paste("Neural Network (AUC =", auc_nn_value, ")")
+), col = c("blue", "green", "red", "purple"), lwd = 2)
+
+
+```
+```{r}
+
+# 📊 Plot ROC curves with AUC labels
+plot(roc_glm, col = "blue", lwd = 2, main = "ROC Curve Comparison")
+lines(roc_tree, col = "green", lwd = 2)
+lines(roc_xgb, col = "red", lwd = 2)
+
+# 🟦 AUC values
+auc_glm_value <- round(auc(roc_glm), 3)
+auc_tree_value <- round(auc(roc_tree), 3)
+auc_xgb_value <- round(auc(roc_xgb), 3)
+
+# 🧾 Add legend with AUC
+legend("bottomright", legend = c(
+  paste("Logistic Regression (AUC =", auc_glm_value, ")"),
+  paste("Decision Tree (AUC =", auc_tree_value, ")"),
+  paste("XGBoost (AUC =", auc_xgb_value, ")")
+), col = c("blue", "green", "red"), lwd = 2)
+
+```
+#Testing with test set
+```{r}
+# ✅ Train XGBoost model
+xgb_grid <- expand.grid(
+  nrounds = 200,
+  max_depth = 6,
+  eta = 0.03,
+  gamma = 0.3,
+  colsample_bytree = 0.7,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+# 🎯 Define cross-validation settings
+xgb_control <- trainControl(
+  method = "cv",                # 5-fold cross-validation
+  number = 5,
+  verboseIter = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+# 🎓 Train model with caret (wrapped XGBoost)
+set.seed(42)
+xgb_tuned <- train(
+  x = train_X[, final_features],
+  y = factor(ifelse(train_y$HOSPITAL_EXPIRE_FLAG == 1, "yes", "no")),
+  method = "xgbTree",
+  trControl = xgb_control,
+  tuneGrid = xgb_grid,
+  metric = "ROC"
+)
+importance <- varImp(xgb_tuned)$importance
+importance$Feature <- rownames(importance)
+
+# Select Top 25
+top25 <- importance %>%
+  arrange(desc(Overall)) %>%
+  head(25)
+
+# Plot
+ggplot(top25, aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 25 Most Important Features", x = "Feature", y = "Importance") +
+  theme_minimal()
+```
+```{r}
+
+# 🔍 Predict on test data
+X_test <- as.data.frame(test_X[, final_features])
+test_preds <- predict(xgb_tuned, newdata = X_test, type = "prob")[, "yes"]
+
+# 💾 Save submission
+submission <- tibble(
+  ID = test_X$icustay_id,
+  HOSPITAL_EXPIRE_FLAG = test_preds
+)
+write_csv(submission, "submission_boost_cv_the_one.csv")
+cat("✅ ssubmission_boost_cv_the_one\n")
+
+```
+#Hyper-parameter
+```{r}
+# Use only final features and labels
+X <- as.data.frame(train_X[, final_features])
+y <- as.factor(train_y$HOSPITAL_EXPIRE_FLAG)  # caret needs factor for classification
+
+```   
+##Define grid of hyperparameters
+```{r}
+xgb_grid <- expand.grid(
+  nrounds = c(100, 150, 200),
+  max_depth = c(6, 8, 10),
+  eta = c(0.01, 0.03, 0.1),
+  gamma = c(0, 0.1, 0.3),
+  colsample_bytree = c(0.7, 0.8),
+  min_child_weight = c(1, 3),
+  subsample = c(0.7, 0.8)
+)
+```
+##Set up cross-validation control
+```{r}
+xgb_control <- trainControl(
+  method = "cv",                  # 5-fold cross-validation
+  number = 5,
+  verboseIter = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  # Use AUC
+  allowParallel = TRUE
+)
+
+```
+##Run the tuning
+```{r}
+set.seed(42)
+
+xgb_tuned <- train(
+  x = X,
+  y = ifelse(y == 1, "yes", "no"),  # caret requires 2-class label
+  method = "xgbTree",
+  trControl = xgb_control,
+  tuneGrid = xgb_grid,
+  metric = "ROC"
+)
+
+```
+#test for the auc
+```{r}
+library(caret)
+
+set.seed(42)
+split_index <- createDataPartition(train_y$HOSPITAL_EXPIRE_FLAG, p = 0.8, list = FALSE)
+
+X_train <- train_X[split_index, ]
+X_val   <- train_X[-split_index, ]
+
+y_train <- train_y$HOSPITAL_EXPIRE_FLAG[split_index]
+y_val   <- train_y$HOSPITAL_EXPIRE_FLAG[-split_index]
+
+dtrain <- xgb.DMatrix(data = as.matrix(X_train[, final_features]), label = y_train)
+dval   <- xgb.DMatrix(data = as.matrix(X_val[, final_features]), label = y_val)
+watchlist <- list(train = dtrain, eval = dval)
+# 1. Logistic Regression (glm)
+set.seed(42)
+logit_model <- train(
+  x = train_X[, final_features],
+  y = target_y,
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary
+  ),
+  metric = "ROC"
+)
+
+# 2. Decision Tree (rpart)
+set.seed(42)
+tree_model <- train(
+  x = train_X[, final_features],
+  y = target_y,
+  method = "rpart",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary
+  ),
+  metric = "ROC"
+)
+
+# 3. Neural Network (nnet)
+set.seed(42)
+nn_model <- train(
+  x = train_X[, final_features],
+  y = target_y,
+  method = "nnet",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary
+  ),
+  tuneGrid = expand.grid(size = 5, decay = 0.1),
+  metric = "ROC",
+  trace = FALSE
+)
+
+xgb_model_val <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  early_stopping_rounds = 20,
+  watchlist = watchlist,
+  maximize = TRUE,
+  print_every_n = 10
+)
+library(pROC)
+library(caret)
+
+val_preds <- predict(xgb_model_val, dval)
+val_pred_class <- ifelse(val_preds > 0.5, 1, 0)
+
+# AUC
+auc_val <- roc(y_val, val_preds)$auc
+cat("Validation AUC:", round(auc_val, 4), "\n")
+
+# Confusion matrix
+conf_val <- confusionMatrix(factor(val_pred_class), factor(y_val), positive = "1")
+print(conf_val)
+plot(roc(y_val, val_preds), col = "blue", main = "Validation ROC Curve")
+
+
+
+```
