@@ -149,16 +149,6 @@ Feature importance from XGBoost highlights:
 These patterns align well with clinical expectations around ICU mortality risk.
 
 ---
-
-### Repository Structure (suggested)
-
-- `README.md` – project overview (this file)
-- `Project_Hoang Gia Phat.qmd` – full Quarto/R Markdown analysis
-- `results/` (optional) – ROC plots, feature importance plots, metrics tables
-- `submission/` (optional) – final prediction file (e.g., `submission_boost_cv_the_one.csv`)
-
-You can adjust this structure as you organize your GitHub portfolio.
-
 ---
 
 ### How to Run
@@ -244,5 +234,6 @@ All AI-suggested ideas and code were **reviewed, tested, and adapted by me**, an
 - Le Gall JR, Lemeshow S, Saulnier F. *A new Simplified Acute Physiology Score (SAPS II)*.  
 - Knaus WA, Draper EA, Wagner DP, Zimmerman JE. *APACHE II: a severity of disease classification system*.  
 - Monash University, **ETC3250/5250** materials on predictive modelling and health analytics.
+
 
 
